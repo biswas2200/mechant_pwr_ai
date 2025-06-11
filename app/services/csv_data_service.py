@@ -140,21 +140,26 @@ class CSVDataService:
             self.support_df = pd.DataFrame()
     
     def _clean_transaction_data(self):
-        """Clean transaction data"""
+        """Clean transaction data by dropping nulls and bad data"""
         if self.transactions_df.empty:
             return
         
         logger.info("🧹 Cleaning transaction data...")
+        original_count = len(self.transactions_df)
         logger.info(f"📋 Original columns: {list(self.transactions_df.columns)}")
+        logger.info(f"📊 Original row count: {original_count}")
         
-        # Show first few rows for debugging
-        logger.info(f"📝 Sample data (first 2 rows):")
-        for i, row in self.transactions_df.head(2).iterrows():
-            logger.info(f"   Row {i}: {dict(row)}")
+        # Drop columns that are mostly empty (>80% null)
+        null_threshold = 0.8
+        null_percentages = self.transactions_df.isnull().sum() / len(self.transactions_df)
+        columns_to_drop = null_percentages[null_percentages > null_threshold].index.tolist()
+        
+        if columns_to_drop:
+            logger.info(f"🗑️ Dropping mostly empty columns: {columns_to_drop}")
+            self.transactions_df = self.transactions_df.drop(columns=columns_to_drop)
         
         # Updated column mapping based on actual txn_refunds.csv structure
         column_mapping = {
-            # Direct mappings for txn_refunds.csv
             'transaction_id': 'txn_id',
             'merchant_display_name': 'merchant_name',
             'txn_status_name': 'status',
@@ -165,13 +170,6 @@ class CSVDataService:
             'txn_completion_date_time': 'completed_at',
             'transaction_type_name': 'transaction_type',
             'category': 'category',
-            
-            # Fallback mappings
-            'transaction_amount': 'amount',
-            'payment_method': 'payment_method',
-            'transaction_status': 'status',
-            'transaction_date': 'created_at',
-            'merchant_name': 'merchant_name'
         }
         
         # Apply mapping
@@ -180,82 +178,109 @@ class CSVDataService:
                 self.transactions_df[new_col] = self.transactions_df[old_col]
                 logger.info(f"✅ Mapped {old_col} → {new_col}")
         
-        # Clean amount - handle both regular amount and convenience fees
+        # Critical columns that MUST have values
+        critical_columns = ['transaction_id', 'amount', 'merchant_display_name', 'transaction_start_date_time']
+        
+        # Drop rows missing critical data
+        for col in critical_columns:
+            if col in self.transactions_df.columns:
+                before_count = len(self.transactions_df)
+                self.transactions_df = self.transactions_df.dropna(subset=[col])
+                after_count = len(self.transactions_df)
+                if before_count != after_count:
+                    logger.info(f"🗑️ Dropped {before_count - after_count} rows missing {col}")
+        
+        # Clean and validate amount
         if 'amount' in self.transactions_df.columns:
             logger.info("💰 Processing amounts...")
+            
+            # Convert to numeric, invalid values become NaN
             self.transactions_df['amount'] = pd.to_numeric(self.transactions_df['amount'], errors='coerce')
             
-            # Check if amounts are in paise (convenience fees columns suggest paise usage)
-            sample_amounts = self.transactions_df['amount'].dropna().head(10)
+            # Drop rows with invalid amounts
+            before_count = len(self.transactions_df)
+            self.transactions_df = self.transactions_df.dropna(subset=['amount'])
+            after_count = len(self.transactions_df)
+            if before_count != after_count:
+                logger.info(f"🗑️ Dropped {before_count - after_count} rows with invalid amounts")
+            
+            # Drop rows with zero or negative amounts
+            before_count = len(self.transactions_df)
+            self.transactions_df = self.transactions_df[self.transactions_df['amount'] > 0]
+            after_count = len(self.transactions_df)
+            if before_count != after_count:
+                logger.info(f"🗑️ Dropped {before_count - after_count} rows with zero/negative amounts")
+            
+            # Remove extreme outliers (amounts > 1 crore)
+            before_count = len(self.transactions_df)
+            self.transactions_df = self.transactions_df[self.transactions_df['amount'] <= 10000000]
+            after_count = len(self.transactions_df)
+            if before_count != after_count:
+                logger.info(f"🗑️ Dropped {before_count - after_count} rows with extreme amounts")
+            
+            # Check if amounts are in paise
             median_amount = self.transactions_df['amount'].median()
-            
-            # Handle case where all amounts are NaN
-            if pd.isna(median_amount):
-                logger.warning("💰 All amounts are invalid, setting to 0")
-                median_amount = 0
-            
-            logger.info(f"💰 Sample amounts: {list(sample_amounts)}")
             logger.info(f"💰 Median amount: {median_amount}")
             
-            # Check if convenience fees are in paise
+            # Convert from paise if needed
             has_convenience_paise = 'convenience_fees_amt_in_paise' in self.transactions_df.columns
-            if has_convenience_paise and median_amount > 10000:  # Likely main amount is also in paise
+            if has_convenience_paise and median_amount > 10000:
                 logger.info("💰 Converting amounts from paise to rupees")
                 self.transactions_df['amount'] = self.transactions_df['amount'] / 100
             
-            self.transactions_df.dropna(inplace=True)
-            # Fill NaN values with 0 and ensure no inf values
-            self.transactions_df['amount'] = self.transactions_df['amount'].fillna(0)
-            self.transactions_df['amount'] = self.transactions_df['amount'].replace([float('inf'), float('-inf')], 0)
-            
             logger.info(f"💰 Final amount range: ₹{self.transactions_df['amount'].min():.2f} to ₹{self.transactions_df['amount'].max():.2f}")
         
-        # Clean datetime - prioritize transaction_start_date_time
+        # Clean and validate dates
         date_columns = ['transaction_start_date_time', 'created_at', 'sale_txn_date_time', 'txn_completion_date_time']
         date_found = False
         
         for date_col in date_columns:
             if date_col in self.transactions_df.columns:
                 logger.info(f"📅 Processing date column: {date_col}")
-                try:
-                    self.transactions_df['created_at'] = pd.to_datetime(self.transactions_df[date_col], errors='coerce')
-                    self.transactions_df['date'] = self.transactions_df['created_at'].dt.date.astype(str)
-                    
-                    valid_dates = self.transactions_df['created_at'].notna().sum()
-                    logger.info(f"📅 Valid dates: {valid_dates} out of {len(self.transactions_df)}")
-                    
-                    if valid_dates > 0:
-                        logger.info(f"📅 Date range: {self.transactions_df['created_at'].min()} to {self.transactions_df['created_at'].max()}")
-                        date_found = True
-                        break
-                except Exception as e:
-                    logger.warning(f"📅 Error processing {date_col}: {e}")
-                    continue
+                
+                # Convert to datetime
+                self.transactions_df['created_at'] = pd.to_datetime(self.transactions_df[date_col], errors='coerce')
+                
+                # Drop rows with invalid dates
+                before_count = len(self.transactions_df)
+                self.transactions_df = self.transactions_df.dropna(subset=['created_at'])
+                after_count = len(self.transactions_df)
+                if before_count != after_count:
+                    logger.info(f"🗑️ Dropped {before_count - after_count} rows with invalid dates")
+                
+                # Drop future dates (likely data errors)
+                before_count = len(self.transactions_df)
+                self.transactions_df = self.transactions_df[self.transactions_df['created_at'] <= datetime.now()]
+                after_count = len(self.transactions_df)
+                if before_count != after_count:
+                    logger.info(f"🗑️ Dropped {before_count - after_count} rows with future dates")
+                
+                # Create date string for easier filtering
+                self.transactions_df['date'] = self.transactions_df['created_at'].dt.date.astype(str)
+                
+                if len(self.transactions_df) > 0:
+                    logger.info(f"📅 Date range: {self.transactions_df['created_at'].min()} to {self.transactions_df['created_at'].max()}")
+                    date_found = True
+                    break
         
         if not date_found:
-            logger.info("📅 No valid date column found, using current date")
-            self.transactions_df['created_at'] = datetime.now()
-            self.transactions_df['date'] = datetime.now().date().isoformat()
+            logger.warning("📅 No valid date column found - this will limit analytics")
         
-        # Ensure created_at has no NaT values
-        if 'created_at' in self.transactions_df.columns:
-            nat_count = self.transactions_df['created_at'].isna().sum()
-            if nat_count > 0:
-                logger.info(f"📅 Filling {nat_count} NaT dates with current time")
-                self.transactions_df['created_at'].fillna(datetime.now(), inplace=True)
-                self.transactions_df['date'] = self.transactions_df['created_at'].dt.date.astype(str)
-        
-        # Clean status using txn_status_name
+        # Clean status
         if 'txn_status_name' in self.transactions_df.columns:
             self.transactions_df['status'] = self.transactions_df['txn_status_name']
         
         if 'status' in self.transactions_df.columns:
             logger.info("✅ Processing transaction statuses...")
             
-            # Show original status values
-            original_statuses = self.transactions_df['status'].value_counts().head(10)
-            logger.info(f"✅ Original statuses: {original_statuses.to_dict()}")
+            # Drop rows with null status
+            before_count = len(self.transactions_df)
+            self.transactions_df = self.transactions_df.dropna(subset=['status'])
+            after_count = len(self.transactions_df)
+            if before_count != after_count:
+                logger.info(f"🗑️ Dropped {before_count - after_count} rows with missing status")
             
+            # Standardize status values
             status_mapping = {
                 'SUCCESS': 'SUCCESS', 'SUCCESSFUL': 'SUCCESS', 'CAPTURED': 'SUCCESS',
                 'SETTLED': 'SUCCESS', 'COMPLETED': 'SUCCESS', 'APPROVED': 'SUCCESS',
@@ -266,25 +291,34 @@ class CSVDataService:
             
             self.transactions_df['status'] = (
                 self.transactions_df['status'].astype(str).str.upper()
-                .map(status_mapping).fillna('SUCCESS')  # Default to SUCCESS for unknown
+                .map(status_mapping)
             )
+            
+            # Drop rows with unmapped status
+            before_count = len(self.transactions_df)
+            self.transactions_df = self.transactions_df.dropna(subset=['status'])
+            after_count = len(self.transactions_df)
+            if before_count != after_count:
+                logger.info(f"🗑️ Dropped {before_count - after_count} rows with unknown status")
             
             final_statuses = self.transactions_df['status'].value_counts()
             logger.info(f"✅ Final status distribution: {final_statuses.to_dict()}")
-        else:
-            logger.info("✅ No status column found, setting all to SUCCESS")
-            self.transactions_df['status'] = 'SUCCESS'
         
-        # Clean payment methods using payment_mode_name
+        # Clean payment methods
         if 'payment_mode_name' in self.transactions_df.columns:
             self.transactions_df['payment_method'] = self.transactions_df['payment_mode_name']
         
         if 'payment_method' in self.transactions_df.columns:
             logger.info("💳 Processing payment methods...")
             
-            original_methods = self.transactions_df['payment_method'].value_counts().head(10)
-            logger.info(f"💳 Original payment methods: {original_methods.to_dict()}")
+            # Drop rows with null payment method
+            before_count = len(self.transactions_df)
+            self.transactions_df = self.transactions_df.dropna(subset=['payment_method'])
+            after_count = len(self.transactions_df)
+            if before_count != after_count:
+                logger.info(f"🗑️ Dropped {before_count - after_count} rows with missing payment method")
             
+            # Standardize payment methods
             payment_mapping = {
                 'CREDIT CARD': 'CREDIT_CARD', 'DEBIT CARD': 'DEBIT_CARD',
                 'UPI': 'UPI', 'NET BANKING': 'NET_BANKING',
@@ -294,79 +328,128 @@ class CSVDataService:
             
             self.transactions_df['payment_method'] = (
                 self.transactions_df['payment_method'].astype(str).str.upper()
-                .map(payment_mapping).fillna(self.transactions_df['payment_method'].astype(str).str.upper())
+                .map(payment_mapping)
+            )
+            
+            # Keep unmapped methods as-is (don't drop them)
+            self.transactions_df['payment_method'] = self.transactions_df['payment_method'].fillna(
+                self.transactions_df['payment_mode_name'].astype(str).str.upper()
             )
             
             final_methods = self.transactions_df['payment_method'].value_counts()
             logger.info(f"💳 Final payment methods: {final_methods.to_dict()}")
-        else:
-            logger.info("💳 No payment method column found, setting all to UPI")
-            self.transactions_df['payment_method'] = 'UPI'
         
-        # Set merchant info using merchant_display_name
+        # Clean merchant names
         if 'merchant_display_name' in self.transactions_df.columns:
+            # Drop rows with null merchant names
+            before_count = len(self.transactions_df)
+            self.transactions_df = self.transactions_df.dropna(subset=['merchant_display_name'])
+            after_count = len(self.transactions_df)
+            if before_count != after_count:
+                logger.info(f"🗑️ Dropped {before_count - after_count} rows with missing merchant name")
+            
             self.transactions_df['merchant_name'] = self.transactions_df['merchant_display_name']
-        elif 'merchant_name' not in self.transactions_df.columns:
-            self.transactions_df['merchant_name'] = 'CSV_MERCHANT'
+            self.transactions_df['merchant_id'] = 'CSV_MERCHANT_001'
         
-        self.transactions_df['merchant_id'] = 'CSV_MERCHANT_001'
+        # Final data quality check
+        final_count = len(self.transactions_df)
+        dropped_count = original_count - final_count
+        drop_percentage = (dropped_count / original_count) * 100
         
-        # Show final summary
-        unique_merchants = self.transactions_df['merchant_name'].nunique()
-        logger.info(f"👥 Unique merchants: {unique_merchants}")
+        logger.info(f"🧹 Data cleaning complete!")
+        logger.info(f"📊 Original: {original_count} rows")
+        logger.info(f"📊 Final: {final_count} rows")
+        logger.info(f"🗑️ Dropped: {dropped_count} rows ({drop_percentage:.1f}%)")
         
-        if unique_merchants <= 5:
-            merchant_names = list(self.transactions_df['merchant_name'].unique())
-            logger.info(f"👥 Merchant names: {merchant_names}")
-        
-        logger.info(f"🎉 Transaction data cleaning complete!")
-        logger.info(f"📊 Final dataset: {len(self.transactions_df)} transactions ready")
+        if final_count > 0:
+            unique_merchants = self.transactions_df['merchant_name'].nunique()
+            logger.info(f"👥 Unique merchants: {unique_merchants}")
+            
+            if unique_merchants <= 5:
+                merchant_names = list(self.transactions_df['merchant_name'].unique())
+                logger.info(f"👥 Merchant names: {merchant_names}")
+        else:
+            logger.error("❌ No valid transactions remaining after cleaning!")
     
     def _clean_settlement_data(self):
-        """Clean settlement data"""
+        """Clean settlement data by dropping nulls"""
         if self.settlements_df.empty:
             return
         
         logger.info("🧹 Cleaning settlement data...")
+        original_count = len(self.settlements_df)
+        
+        # Drop mostly empty columns
+        null_threshold = 0.8
+        null_percentages = self.settlements_df.isnull().sum() / len(self.settlements_df)
+        columns_to_drop = null_percentages[null_percentages > null_threshold].index.tolist()
+        
+        if columns_to_drop:
+            logger.info(f"🗑️ Dropping mostly empty settlement columns: {columns_to_drop}")
+            self.settlements_df = self.settlements_df.drop(columns=columns_to_drop)
         
         # Clean settlement amounts
         amount_columns = ['amount', 'settlement_amount', 'actual_txn_amount', 'refund_amount']
         for col in amount_columns:
             if col in self.settlements_df.columns:
-                self.settlements_df[col] = pd.to_numeric(self.settlements_df[col], errors='coerce').fillna(0)
+                # Convert to numeric and drop invalid values
+                self.settlements_df[col] = pd.to_numeric(self.settlements_df[col], errors='coerce')
+                before_count = len(self.settlements_df)
+                self.settlements_df = self.settlements_df.dropna(subset=[col])
+                after_count = len(self.settlements_df)
+                if before_count != after_count:
+                    logger.info(f"🗑️ Dropped {before_count - after_count} settlements with invalid {col}")
                 
                 # Convert from paise if needed
                 median_val = self.settlements_df[col].median()
-                if pd.notna(median_val) and median_val > 10000:  # Likely in paise
+                if median_val > 10000:  # Likely in paise
                     logger.info(f"💰 Converting {col} from paise to rupees")
                     self.settlements_df[col] = self.settlements_df[col] / 100
-                
-                # Ensure no inf values
-                self.settlements_df[col] = self.settlements_df[col].replace([float('inf'), float('-inf')], 0)
         
-        self.settlements_df.dropna(inplace=True)
         # Clean settlement dates
         if 'transaction_start_date_time' in self.settlements_df.columns:
             self.settlements_df['settlement_date'] = pd.to_datetime(
                 self.settlements_df['transaction_start_date_time'], errors='coerce'
             )
-            # Fill NaT values with current time
-            self.settlements_df['settlement_date'].fillna(datetime.now(), inplace=True)
+            # Drop rows with invalid dates
+            before_count = len(self.settlements_df)
+            self.settlements_df = self.settlements_df.dropna(subset=['settlement_date'])
+            after_count = len(self.settlements_df)
+            if before_count != after_count:
+                logger.info(f"🗑️ Dropped {before_count - after_count} settlements with invalid dates")
         
         # Clean merchant names
         if 'merchant_display_name' in self.settlements_df.columns:
-            self.settlements_df['merchant_name'] = self.settlements_df['merchant_display_name'].fillna('UNKNOWN_MERCHANT')
+            before_count = len(self.settlements_df)
+            self.settlements_df = self.settlements_df.dropna(subset=['merchant_display_name'])
+            after_count = len(self.settlements_df)
+            if before_count != after_count:
+                logger.info(f"🗑️ Dropped {before_count - after_count} settlements with missing merchant names")
+            
+            self.settlements_df['merchant_name'] = self.settlements_df['merchant_display_name']
         
-        logger.info(f"✅ Settlement data ready: {len(self.settlements_df)} records")
+        final_count = len(self.settlements_df)
+        logger.info(f"✅ Settlement data ready: {final_count} records (dropped {original_count - final_count})")
     
     def _clean_support_data(self):
-        """Clean support data"""
+        """Clean support data by dropping nulls"""
         if self.support_df.empty:
             return
         
         logger.info("🧹 Cleaning support data...")
-        # Basic support cleaning - can be expanded based on actual support data structure
-        logger.info(f"✅ Support data ready: {len(self.support_df)} records")
+        original_count = len(self.support_df)
+        
+        # Drop mostly empty columns
+        null_threshold = 0.8
+        null_percentages = self.support_df.isnull().sum() / len(self.support_df)
+        columns_to_drop = null_percentages[null_percentages > null_threshold].index.tolist()
+        
+        if columns_to_drop:
+            logger.info(f"🗑️ Dropping mostly empty support columns: {columns_to_drop}")
+            self.support_df = self.support_df.drop(columns=columns_to_drop)
+        
+        final_count = len(self.support_df)
+        logger.info(f"✅ Support data ready: {final_count} records (dropped {original_count - final_count})")
     
     def get_transactions(self, merchant_id: Optional[str] = None, days: int = 30) -> pd.DataFrame:
         """Get transaction data"""
@@ -383,30 +466,6 @@ class CSVDataService:
             original_count = len(df)
             df = df[df['created_at'] >= cutoff_date]
             logger.info(f"📅 Filtered to last {days} days: {len(df)} transactions (from {original_count})")
-        
-        # Clean NaN values before returning
-        df = self._clean_dataframe_for_json(df)
-        
-        return df
-    
-    def _clean_dataframe_for_json(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Clean DataFrame to remove NaN values that cause JSON serialization issues"""
-        if df.empty:
-            return df
-        
-        # Replace NaN values based on column types
-        for col in df.columns:
-            if df[col].dtype in ['float64', 'float32']:
-                # Replace NaN in numeric columns with 0
-                df[col] = df[col].fillna(0)
-                # Replace inf values with 0
-                df[col] = df[col].replace([float('inf'), float('-inf')], 0)
-            elif df[col].dtype == 'object':
-                # Replace NaN in string/object columns with empty string
-                df[col] = df[col].fillna('')
-            elif 'datetime' in str(df[col].dtype):
-                # Replace NaT in datetime columns with a default date
-                df[col] = df[col].fillna(datetime.now())
         
         return df
     
@@ -426,9 +485,6 @@ class CSVDataService:
             df = df[df['settlement_date'] >= cutoff_date]
             logger.info(f"📅 Filtered to last {days} days: {len(df)} settlements (from {original_count})")
         
-        # Clean NaN values before returning
-        df = self._clean_dataframe_for_json(df)
-        
         return df
     
     def get_merchant_names(self) -> List[str]:
@@ -441,18 +497,8 @@ class CSVDataService:
             logger.warning("❌ No merchant_name column found in transactions")
             return []
         
-        # Get unique merchant names, excluding NaN values, and convert to strings
-        merchant_names = (
-            self.transactions_df['merchant_name']
-            .dropna()  # Remove NaN values
-            .astype(str)  # Convert to string to handle any remaining edge cases
-            .unique()
-            .tolist()
-        )
-        
-        # Filter out empty strings and 'nan' strings
-        merchant_names = [name for name in merchant_names if name and name.lower() != 'nan']
-        
+        # Since we already dropped nulls during cleaning, just get unique values
+        merchant_names = self.transactions_df['merchant_name'].unique().tolist()
         logger.info(f"👥 Found {len(merchant_names)} unique merchants")
         
         return merchant_names
@@ -466,51 +512,17 @@ class CSVDataService:
         }
         
         if not self.transactions_df.empty:
-            # Calculate total amount safely
-            total_amount = 0
-            if 'amount' in self.transactions_df.columns:
-                amount_sum = self.transactions_df['amount'].sum()
-                total_amount = float(amount_sum) if not pd.isna(amount_sum) else 0
-            
-            # Get date range safely
-            date_start = None
-            date_end = None
-            if 'created_at' in self.transactions_df.columns:
-                min_date = self.transactions_df['created_at'].min()
-                max_date = self.transactions_df['created_at'].max()
-                date_start = str(min_date) if not pd.isna(min_date) else None
-                date_end = str(max_date) if not pd.isna(max_date) else None
-            
-            # Get merchants safely
-            merchants = []
-            total_merchants = 0
-            if 'merchant_name' in self.transactions_df.columns:
-                unique_merchants = self.transactions_df['merchant_name'].dropna().unique()
-                merchants = [str(m) for m in unique_merchants[:10]]  # Convert to string to avoid NaN issues
-                total_merchants = len(unique_merchants)
-            
-            # Get payment methods safely
-            payment_methods = []
-            if 'payment_method' in self.transactions_df.columns:
-                unique_methods = self.transactions_df['payment_method'].dropna().unique()
-                payment_methods = [str(m) for m in unique_methods]
-            
-            # Get transaction statuses safely
-            transaction_statuses = []
-            if 'status' in self.transactions_df.columns:
-                unique_statuses = self.transactions_df['status'].dropna().unique()
-                transaction_statuses = [str(s) for s in unique_statuses]
-            
+            # All data is clean, so we can directly calculate without null checks
             summary.update({
                 'date_range': {
-                    'start': date_start,
-                    'end': date_end
+                    'start': str(self.transactions_df['created_at'].min()) if 'created_at' in self.transactions_df.columns else None,
+                    'end': str(self.transactions_df['created_at'].max()) if 'created_at' in self.transactions_df.columns else None
                 },
-                'merchants': merchants,
-                'total_amount': total_amount,
-                'payment_methods': payment_methods,
-                'transaction_statuses': transaction_statuses,
-                'total_merchants': total_merchants
+                'merchants': self.transactions_df['merchant_name'].unique().tolist()[:10] if 'merchant_name' in self.transactions_df.columns else [],
+                'total_amount': float(self.transactions_df['amount'].sum()) if 'amount' in self.transactions_df.columns else 0,
+                'payment_methods': self.transactions_df['payment_method'].unique().tolist() if 'payment_method' in self.transactions_df.columns else [],
+                'transaction_statuses': self.transactions_df['status'].unique().tolist() if 'status' in self.transactions_df.columns else [],
+                'total_merchants': self.transactions_df['merchant_name'].nunique() if 'merchant_name' in self.transactions_df.columns else 0
             })
         
         return summary
